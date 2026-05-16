@@ -27,7 +27,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(__file__))
 
 from base_env import EnvPool
-from models import StatePolicy, SafetyCritic, gated_ppo_update
+from models import StatePolicy, SafetyCritic, gated_ppo_update, nullspace_ppo_update
 
 
 # ── Robot registry ──────────────────────────────────────────────────
@@ -243,7 +243,8 @@ def main(args):
         # During warmup, disable gating (all states treated as safe)
         effective_delta = args.safety_delta if it > args.critic_warmup else -1e6
 
-        stats = gated_ppo_update(
+        update_fn = nullspace_ppo_update if args.method == 'nullspace' else gated_ppo_update
+        stats = update_fn(
             policy, safety_critic, optimizer,
             flat_s,
             flat_a,
@@ -317,6 +318,8 @@ if __name__ == "__main__":
     p.add_argument("--iterations", type=int, default=500)
     p.add_argument("--clip_eps", type=float, default=0.2)
     # Safety / gating
+    p.add_argument("--method", choices=["gated", "nullspace"], default="gated",
+                   help="'gated' = hard binary gate (ShieldVLA Eq.5), 'nullspace' = null-space projection")
     p.add_argument("--safety_delta", type=float, default=0.0,
                    help="Q_c gate threshold (gate = Q_c > delta). Higher = more conservative.")
     p.add_argument("--critic_warmup", type=int, default=0,

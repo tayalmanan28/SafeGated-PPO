@@ -284,3 +284,74 @@ def nullspace_ppo_update(
     for k in stats:
         stats[k] /= max(n_updates, 1)
     return stats
+
+# ── Runtime Safety Shield (eval-time action filtering) ────────────────
+
+class SafetyShield:
+    """At deployment, projects unsafe actions toward the safety-maximizing
+    direction using gradient ascent on Q_c.
+    
+    If Q_c(s, a_policy) > delta: pass through (safe)
+    If Q_c(s, a_policy) <= delta: do a few steps of gradient ascent on a
+    to maximize Q_c(s, a), starting from a_policy.
+    
+    This guarantees (approximately) that deployed actions always satisfy
+    the safety constraint, without changing the trained policy weights.
+    """
+    
+    def __init__(self, safety_critic: SafetyCritic, delta: float = 0.0,
+                 n_steps: int = 10, step_size: float = 0.1):
+        self.safety_critic = safety_critic
+        self.delta = delta
+        self.n_steps = n_steps
+        self.step_size = step_size
+    
+    def filter_action(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """Filter a single action. state: (1, S), action: (1, A)."""
+        with torch.no_grad():
+            qc = self.safety_critic.min_q(state, action)
+        
+        if qc.item() > self.delta:
+            return action  # safe, pass through
+        
+        # Unsafe: gradient ascent on Q_c w.r.t. action
+        a = action.clone().detach().requires_grad_(True)
+        for _ in range(self.n_steps):
+            q = self.safety_critic.min_q(state, a)
+            if q.item() > self.delta:
+                break  # reached safety
+            grad = torch.autograd.grad(q, a)[0]
+            a = (a + self.step_size * grad).detach().requires_grad_(True)
+            a = a.clamp(-1, 1)  # keep in action bounds
+        
+        return a.detach()
+    
+    def batch_filter(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """Filter a batch. states: (N, S), actions: (N, A)."""
+        with torch.no_grad():
+            qc = self.safety_critic.min_q(states, actions)
+        
+        unsafe = qc <= self.delta
+        if not unsafe.any():
+            return actions
+        
+        # Only optimize unsafe actions
+        safe_actions = actions.clone()
+        unsafe_idx = unsafe.nonzero(as_tuple=True)[0]
+        
+        a = actions[unsafe_idx].clone().detach().requires_grad_(True)
+        s = states[unsafe_idx]
+        
+        for _ in range(self.n_steps):
+            q = self.safety_critic.min_q(s, a)
+            # Only continue for still-unsafe ones
+            still_unsafe = q <= self.delta
+            if not still_unsafe.any():
+                break
+            loss = -q[still_unsafe].sum()
+            grad = torch.autograd.grad(loss, a)[0]
+            a = (a + self.step_size * grad).detach().requires_grad_(True)
+            a = a.clamp(-1, 1)
+        
+        safe_actions[unsafe_idx] = a.detach()
+        return safe_actions
